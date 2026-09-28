@@ -1,0 +1,5 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": ["dnsimple_cli", "tests"]
+}
