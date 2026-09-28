@@ -25,6 +25,9 @@ Agent-friendly output and fixes found while building a Claude skill on the CLI.
   `v=spf1 -all` instead of a failure. Results carry an optional `recommendation`, and the
   report a `mail_mode` (`receive`, `send-only`, `none`).
 - Tests: the JSON contract, ids, stamps, colour, `nameservers` and health modes (29 total).
+- Works on Typer 0.27+, which no longer depends on Click (the entry point had imported
+  `click`, breaking `uv tool install`). Lock upgraded to Typer 0.27.2; CI now smoke-tests
+  the tool-installed command, not only the locked venv.
 
 ## 0.1.0 — 2026-09-28 (on `main`, untagged)
 

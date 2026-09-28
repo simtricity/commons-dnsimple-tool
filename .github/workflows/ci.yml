@@ -20,3 +20,12 @@ jobs:
       # on maintainers' machines against ../_boundary/denylist.txt.
       - run: uv run pytest -q -rs
       - run: uvx pyright
+      # `uv tool install` ignores uv.lock and resolves the newest dependencies, which is
+      # what users get. Prove that install runs, not just the locked venv.
+      - name: Tool install smoke test
+        run: |
+          uv tool install .
+          dnsimple --help > /dev/null
+          out=$(dnsimple records --bogus --json || true)
+          echo "$out"
+          echo "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); assert d["ok"] is False, d'
