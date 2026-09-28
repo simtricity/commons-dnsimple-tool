@@ -45,11 +45,19 @@ uv tool install --editable .   # global `dnsimple` from this checkout
 - **Writes confirm unless `--yes`.** `record-create` is the one command that does not
   confirm; keep that in mind when scripting it.
 
-## Known gaps
+## Output contract (`dnsimple_cli/output.py`)
 
-- No `--json` output yet. The workspace convention is `--json` on every command; add it to
-  the read commands (`whoami`, `domains`, `domain`, `records`, `services`, `apps`, `email`,
-  `health`, `delegation-audit`, `transfer-status`) first.
+- `main()` strips `--json` from anywhere in argv and configures one console: stdout in human
+  mode, stderr under `--json`, plain whenever `NO_COLOR` is set or the stream is not a TTY.
+- Commands print progress with `console.print`, human-only tables with `show()`, and their
+  result with `emit({...})` (snake_case keys, as DNSimple sends them). `fail(msg)` for
+  errors. `ask(prompt)` instead of `typer.confirm`: it refuses under `--json` (exit 3).
+- `get_client()` returns a `RecordingClient`, so every API write lands in `changes`
+  without each command tracking it. `main()` guarantees exactly one stdout object.
+- Store and print time in UTC (`utcnow()`, `utc_iso()`); 0.1.0's naive local stamps are
+  converted on read.
+- The marketplace `/simt-local:dnsimple` skill drives this CLI through `--json`; changing a
+  key is a breaking change for it.
 
 ## Rules
 

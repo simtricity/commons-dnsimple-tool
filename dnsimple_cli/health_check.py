@@ -20,6 +20,7 @@ class HealthResult:
     check: str
     status: str  # "pass", "warn", "fail"
     message: str
+    recommendation: str | None = None
 
 
 @dataclass
@@ -28,6 +29,9 @@ class HealthReport:
 
     domain: str
     results: list[HealthResult] = field(default_factory=list)
+    #: "receive" (root MX), "send-only" (no root MX but sends: DKIM, or a sender
+    #: subdomain with its own SPF or MX), or "none".
+    mail_mode: str = "receive"
 
     @property
     def pass_count(self) -> int:
@@ -50,23 +54,68 @@ def _get_txt_content(record: DNSRecord) -> str:
     return content
 
 
-def check_mx(records: list[DNSRecord]) -> HealthResult:
-    """Check that MX records exist at the root."""
+def sender_subdomains(records: list[DNSRecord]) -> list[str]:
+    """Subdomains that carry their own SPF or MX, e.g. `send` for Resend's envelope sender."""
+    names = set()
+    for r in records:
+        if not r.name or r.name.startswith("_"):
+            continue
+        if r.type == "MX" or (r.type == "TXT" and _get_txt_content(r).startswith("v=spf1")):
+            names.add(r.name)
+    return sorted(names)
+
+
+def mail_mode(records: list[DNSRecord]) -> str:
+    """How the domain uses mail: "receive", "send-only" or "none"."""
+    if any(r.type == "MX" and r.name == "" for r in records):
+        return "receive"
+    has_dkim = any("_domainkey" in r.name.lower() for r in records)
+    if has_dkim or sender_subdomains(records):
+        return "send-only"
+    return "none"
+
+
+def check_mx(records: list[DNSRecord], mode: str = "receive") -> HealthResult:
+    """Check that MX records exist at the root. A send-only domain needs none."""
     mx = [r for r in records if r.type == "MX" and r.name == ""]
+    if not mx and mode == "send-only":
+        return HealthResult(
+            "MX Records", "pass",
+            "No root MX: send-only domain, not expected to receive mail",
+        )
     if not mx:
         return HealthResult("MX Records", "fail", "No MX records found — domain cannot receive email")
     providers = ", ".join(r.content for r in mx)
     return HealthResult("MX Records", "pass", f"{len(mx)} MX record(s): {providers}")
 
 
-def check_spf(records: list[DNSRecord]) -> HealthResult:
-    """Check SPF record exists and has a reasonable policy."""
+def check_spf(records: list[DNSRecord], mode: str = "receive") -> HealthResult:
+    """Check SPF record exists and has a reasonable policy.
+
+    A domain that receives no mail at its root needs no sending SPF there: senders such as
+    Resend use `send.<domain>` as the envelope sender, which has its own SPF. The root then
+    only needs `v=spf1 -all` so nothing can send as it.
+    """
     spf_records = []
     for r in records:
         if r.type == "TXT" and r.name == "":
             content = _get_txt_content(r)
             if content.startswith("v=spf1"):
                 spf_records.append(content)
+
+    if not spf_records and mode in ("send-only", "none"):
+        subs = sender_subdomains(records)
+        if len(subs) == 1:
+            where = f"sending uses the '{subs[0]}' subdomain, which has its own SPF"
+        elif subs:
+            where = f"sending uses the {', '.join(repr(x) for x in subs)} subdomains, which have their own SPF"
+        else:
+            where = "the root sends no mail"
+        return HealthResult(
+            "SPF Record", "warn",
+            f"No root SPF; {where}. Not a failure for a domain with no root MX.",
+            recommendation='Add TXT @ "v=spf1 -all" so nothing can send as the root domain',
+        )
 
     if not spf_records:
         return HealthResult("SPF Record", "fail", "No SPF record found — outbound email not authenticated")
@@ -185,11 +234,12 @@ def run_health_check(domain_name: str, records: list[DNSRecord]) -> HealthReport
     Returns:
         HealthReport with all check results
     """
-    report = HealthReport(domain=domain_name)
+    mode = mail_mode(records)
+    report = HealthReport(domain=domain_name, mail_mode=mode)
 
     report.results.append(check_ns(records))
-    report.results.append(check_mx(records))
-    report.results.append(check_spf(records))
+    report.results.append(check_mx(records, mode))
+    report.results.append(check_spf(records, mode))
     report.results.append(check_dkim(records))
     report.results.append(check_dmarc(records))
     report.results.append(check_www(records))

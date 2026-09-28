@@ -56,7 +56,7 @@ dnsimple sync                    # incremental sync from the API
 dnsimple sync --force            # full sync of all zones
 dnsimple domains [--all]         # primary domains [plus subdomains with their own mail]
 dnsimple domain example.com      # one domain in detail
-dnsimple records example.com     # every record in the zone
+dnsimple records example.com     # every record in the zone, with the ID record-update/-delete need
 dnsimple services                # ownership verifications across all domains
 dnsimple apps                    # traffic routing (CNAME/ALIAS targets) across all domains
 dnsimple email [--mx|--smtp]     # inbound (MX) and outbound (SPF/DKIM) providers
@@ -70,7 +70,8 @@ includes and DKIM).
 ### Record sets and edits
 
 Every command below that writes shows the change and asks for confirmation; `--yes` skips
-the prompt. **`record-create` is the exception: it writes immediately.**
+the prompt. **`record-create` is the exception: it writes immediately.** (So is
+`nameservers-set --yes`, by definition.)
 
 ```bash
 dnsimple email-setup example.com --provider google       # Google Workspace MX + SPF
@@ -92,7 +93,8 @@ dnsimple transfer-check example.net                 # TLD, pricing and WHOIS loc
 dnsimple transfer example.net --auth-code CODE      # initiate an inbound transfer
 dnsimple transfer-status --refresh                  # progress of every transfer
 dnsimple transfer-cancel example.net
-dnsimple nameservers example.net [--set-dnsimple | --ns a --ns b]
+dnsimple nameservers example.net                    # show delegation (read-only)
+dnsimple nameservers-set example.net --dnsimple     # change it; confirms unless --yes (or --ns a --ns b)
 dnsimple delegation-audit                           # domains not yet delegated to DNSimple
 ```
 
@@ -102,6 +104,12 @@ dnsimple delegation-audit                           # domains not yet delegated 
 dnsimple health example.com   # MX, SPF, DKIM, DMARC, NS, www and apex checks
 dnsimple report               # HTML audit report into <state>/reports/
 ```
+
+`health` knows three mail modes. **receive** (a root MX) checks everything as before.
+**send-only** (no root MX, but DKIM or a sender subdomain such as `send.<domain>` with its
+own SPF or MX, the Resend pattern) passes MX and, with no root SPF, warns and recommends
+`v=spf1 -all` rather than failing. **none** (no mail signals at all) still fails MX and gets
+the same SPF recommendation.
 
 `report` needs `<state>/data/report-recommendations.json`: a list of `groups`, each with
 `name`, `category`, `primary_domain`, `domains` and `recommendations` (`severity`, `title`,
@@ -119,6 +127,27 @@ dnsimple report               # HTML audit report into <state>/reports/
 
 Without `categories`, one section is made per distinct `category` value. Colours:
 `purple`, `blue`, `green`, `amber`, `gray`.
+
+## Machine-readable output
+
+Add `--json` anywhere on the command line. stdout then carries exactly one JSON object;
+progress and tables go to stderr.
+
+- Success: `{"ok": true, ...}`. Keys follow DNSimple's snake_case.
+- Failure: `{"ok": false, "error": "..."}` with a non-zero exit (usage errors exit 2).
+- A write that would ask for confirmation refuses under `--json` with exit 3 and
+  `"confirmation required: re-run with --yes to apply"`. Writes that do run include a
+  `changes` list: one entry per record created, updated or deleted, delegation changed or
+  transfer started or cancelled.
+- Timestamps are UTC, `YYYY-MM-DDTHH:MM:SSZ`. Commands that read synced data include
+  `synced_at`, the time of the last successful `sync` (refreshed even when nothing changed).
+
+```bash
+dnsimple records example.com --json | jq '.records[] | select(.type=="TXT") | {id, name, content}'
+dnsimple health example.com --json | jq '.results[] | select(.status!="pass")'
+```
+
+Colour is off when `NO_COLOR` is set or stdout is not a terminal.
 
 ## Verifying a change
 

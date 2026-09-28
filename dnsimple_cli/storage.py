@@ -1,7 +1,7 @@
 """TinyDB storage layer for DNSimple CLI."""
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -192,7 +192,7 @@ def process_api_data(
     Returns:
         Tuple of (list of Domain objects, SyncMetadata)
     """
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     domains: list[Domain] = []
     subdomain_count = 0
 

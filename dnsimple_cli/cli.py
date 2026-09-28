@@ -4,15 +4,24 @@ import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from dotenv import load_dotenv
-from rich.console import Console
 from rich.table import Table
 
 from dnsimple_cli.api import DNSimpleClient, DNSimpleAPIError
 from dnsimple_cli.models import DomainTransfer
+from dnsimple_cli.output import (
+    ask,
+    console,
+    emit,
+    fail,
+    record_change,
+    show,
+    utc_iso,
+    utcnow,
+)
 from dnsimple_cli.storage import Storage, get_state_dir, process_api_data
 
 # Load credentials from the state dir (see get_state_dir). Variables already set in the
@@ -24,8 +33,71 @@ else:
     # fallback: legacy ./.env in the current directory, for setups that predate the state dir
     load_dotenv(Path.cwd() / ".env")
 
-app = typer.Typer(help="DNSimple Domain Manager CLI")
-console = Console()
+app = typer.Typer(
+    help="DNSimple Domain Manager CLI. Add --json to any command for machine-readable output.",
+    pretty_exceptions_enable=False,
+)
+
+
+class RecordingClient(DNSimpleClient):
+    """The API client, recording every write so `--json` output can list what changed."""
+
+    def create_record(
+        self,
+        zone: str,
+        record_type: str,
+        name: str,
+        content: str,
+        ttl: int = 3600,
+        priority: int | None = None,
+    ) -> dict[str, Any]:
+        result = super().create_record(zone, record_type, name, content, ttl, priority)
+        record_change("record.create", zone=zone, id=result.get("id"), type=record_type,
+                      name=name, content=content, ttl=ttl, priority=priority)
+        return result
+
+    def update_record(
+        self,
+        zone: str,
+        record_id: int,
+        content: str | None = None,
+        ttl: int | None = None,
+        priority: int | None = None,
+    ) -> dict[str, Any]:
+        result = super().update_record(zone, record_id, content, ttl, priority)
+        changed = {"content": content, "ttl": ttl, "priority": priority}
+        record_change("record.update", zone=zone, id=record_id,
+                      **{k: v for k, v in changed.items() if v is not None})
+        return result
+
+    def delete_record(self, zone: str, record_id: int) -> dict[str, Any]:
+        result = super().delete_record(zone, record_id)
+        record_change("record.delete", zone=zone, id=record_id)
+        return result
+
+    def change_delegation(self, domain: str, nameservers: list[str]) -> list[str]:
+        result = super().change_delegation(domain, nameservers)
+        record_change("delegation.change", domain=domain, nameservers=result)
+        return result
+
+    def transfer_domain(
+        self,
+        domain: str,
+        registrant_id: int,
+        auth_code: str,
+        auto_renew: bool = True,
+        whois_privacy: bool = False,
+    ) -> dict[str, Any]:
+        result = super().transfer_domain(domain, registrant_id, auth_code, auto_renew,
+                                         whois_privacy)
+        record_change("transfer.create", domain=domain, id=result.get("id"),
+                      state=result.get("state"))
+        return result
+
+    def cancel_transfer(self, domain: str, transfer_id: int) -> dict[str, Any]:
+        result = super().cancel_transfer(domain, transfer_id)
+        record_change("transfer.cancel", domain=domain, id=transfer_id)
+        return result
 
 
 def get_client() -> DNSimpleClient:
@@ -46,7 +118,7 @@ def get_client() -> DNSimpleClient:
         )
         raise typer.Exit(1)
 
-    return DNSimpleClient(account_id, access_token)
+    return RecordingClient(account_id, access_token)
 
 
 def check_whois_transfer_lock(domain_name: str) -> tuple[bool, list[str]]:
@@ -101,7 +173,7 @@ def _sync_zone(client: DNSimpleClient, storage: Storage, zone_name: str) -> None
     # Re-run detection via process helper
     from dnsimple_cli.storage import _create_domain
 
-    now = datetime.now()
+    now = utcnow()
     primary = _create_domain(
         name=zone_name,
         parent_domain=None,
@@ -147,6 +219,11 @@ def require_sync() -> Storage:
     return storage
 
 
+def _synced_at(storage: Storage) -> str | None:
+    meta = storage.get_metadata()
+    return utc_iso(meta.synced_at) if meta else None
+
+
 # =============================================================================
 # Commands
 # =============================================================================
@@ -169,6 +246,7 @@ def whoami():
                 user = info["user"]
                 console.print(f"User ID: {user.get('id')}")
                 console.print(f"Email: {user.get('email')}")
+            emit({"account": info.get("account"), "user": info.get("user")})
     except DNSimpleAPIError as e:
         console.print(f"[red]API Error:[/red] {e.message}")
         raise typer.Exit(1)
@@ -197,18 +275,21 @@ def sync(
                     console.print("[bold]Full sync requested...[/bold]")
                 else:
                     console.print("[bold]No existing data, performing full sync...[/bold]")
-                _full_sync(client, storage)
+                result = _full_sync(client, storage)
             else:
-                _incremental_sync(client, storage, existing_domains)
+                result = _incremental_sync(client, storage, existing_domains)
 
+            result["synced_at"] = _synced_at(storage)
             storage.close()
+            console.print(f"Synced at: {result['synced_at']}")
+            emit(result)
 
     except DNSimpleAPIError as e:
         console.print(f"[red]API Error:[/red] {e.message}")
         raise typer.Exit(1)
 
 
-def _full_sync(client: DNSimpleClient, storage: Storage) -> None:
+def _full_sync(client: DNSimpleClient, storage: Storage) -> dict[str, Any]:
     """Perform a full sync of all domains and records."""
     console.print("[bold]Fetching domains from DNSimple...[/bold]")
 
@@ -238,13 +319,18 @@ def _full_sync(client: DNSimpleClient, storage: Storage) -> None:
         f"\n[green]Full sync: {metadata.domain_count} domains "
         f"({metadata.subdomain_count} subdomains)[/green]"
     )
+    return {
+        "mode": "full",
+        "domains": metadata.domain_count,
+        "subdomains": metadata.subdomain_count,
+    }
 
 
 def _incremental_sync(
     client: DNSimpleClient,
     storage: Storage,
     existing_domains: dict,
-) -> None:
+) -> dict[str, Any]:
     """Perform incremental sync - only fetch records for changed zones."""
     from dnsimple_cli.models import Domain
 
@@ -292,8 +378,14 @@ def _incremental_sync(
         console.print(f"  [red]DELETED:[/red] {zone_name}")
 
     if not changed_zones and not deleted_zones:
+        # A sync that finds nothing still proves the data is current: refresh the stamp.
+        meta = storage.get_metadata()
+        if meta:
+            meta.synced_at = utcnow()
+            storage.save_metadata(meta)
         console.print("\n[green]No changes detected. Everything up to date.[/green]")
-        return
+        return {"mode": "incremental", "changed": [], "deleted": [],
+                "unchanged": len(unchanged_zones)}
 
     console.print(f"\n[bold]Fetching {len(changed_zones)} changed zone(s)...[/bold]")
 
@@ -327,14 +419,13 @@ def _incremental_sync(
     final_domains.extend(new_domains)
 
     # Create metadata
-    from datetime import datetime
     from dnsimple_cli.models import SyncMetadata
 
     primary_count = len([d for d in final_domains if d.parent_domain is None])
     subdomain_count = len([d for d in final_domains if d.parent_domain is not None])
 
     metadata = SyncMetadata(
-        synced_at=datetime.now(),
+        synced_at=utcnow(),
         account_id=client.account_id,
         domain_count=primary_count,
         subdomain_count=subdomain_count,
@@ -347,6 +438,8 @@ def _incremental_sync(
         f"\n[green]Incremental sync: {len(changed_zones)} zone(s) updated, "
         f"{len(unchanged_zones)} unchanged[/green]"
     )
+    return {"mode": "incremental", "changed": sorted(changed_zones),
+            "deleted": sorted(deleted_zones), "unchanged": len(unchanged_zones)}
 
 
 @app.command()
@@ -382,11 +475,27 @@ def domains(
                 str(len(domain.email_smtp)),
             )
 
-        console.print(table)
+        show(table)
         if metadata:
-            console.print(f"\nSynced at: {metadata.synced_at.isoformat()}")
+            console.print(f"\nSynced at: {utc_iso(metadata.synced_at)}")
             if not all_domains:
                 console.print("[dim]Use --all to include subdomains[/dim]")
+        emit({
+            "synced_at": utc_iso(metadata.synced_at) if metadata else None,
+            "domains": [
+                {
+                    "name": d.name,
+                    "parent_domain": d.parent_domain,
+                    "state": d.state,
+                    "records": len(d.records),
+                    "services": len(d.services),
+                    "apps": len(d.apps),
+                    "email_mx": d.email_mx.provider if d.email_mx else None,
+                    "email_smtp": [x.provider for x in d.email_smtp],
+                }
+                for d in sorted(domain_list, key=lambda d: (d.parent_domain or "", d.name))
+            ],
+        })
     finally:
         storage.close()
 
@@ -399,8 +508,8 @@ def domain(domain_name: str):
     try:
         dom = storage.get_domain(domain_name)
         if not dom:
-            console.print(f"[red]Domain '{domain_name}' not found.[/red]")
-            raise typer.Exit(1)
+            fail(f"Domain '{domain_name}' not found. Run 'dnsimple sync' if it is new.")
+            return
 
         console.print(f"\n[bold cyan]{dom.name}[/bold cyan]")
         if dom.parent_domain:
@@ -445,6 +554,12 @@ def domain(domain_name: str):
                 console.print(f"  • {sub.name}")
 
         console.print()
+        emit({
+            "synced_at": _synced_at(storage),
+            "domain": dom.model_dump(mode="json", exclude={"records"}),
+            "record_count": len(dom.records),
+            "subdomains": [sub.name for sub in subdomains],
+        })
 
     finally:
         storage.close()
@@ -473,7 +588,15 @@ def services():
                     svc.record_name,
                 )
 
-        console.print(table)
+        show(table)
+        emit({
+            "synced_at": _synced_at(storage),
+            "services": [
+                {"domain": d.name, "provider": x.provider, "type": x.service_type,
+                 "record": x.record_name}
+                for d in sorted(domain_list, key=lambda d: d.name) for x in d.services
+            ],
+        })
 
     finally:
         storage.close()
@@ -502,7 +625,15 @@ def apps():
                     app.target,
                 )
 
-        console.print(table)
+        show(table)
+        emit({
+            "synced_at": _synced_at(storage),
+            "apps": [
+                {"domain": d.name, "subdomain": a.subdomain, "provider": a.provider,
+                 "target": a.target}
+                for d in sorted(domain_list, key=lambda d: d.name) for a in d.apps
+            ],
+        })
 
     finally:
         storage.close()
@@ -545,7 +676,7 @@ def email(
                         mx_list,
                     )
 
-            console.print(table)
+            show(table)
             console.print()
 
         if smtp_only:
@@ -566,7 +697,23 @@ def email(
                         smtp.dkim_record or "",
                     )
 
-            console.print(table)
+            show(table)
+
+        data: dict[str, Any] = {"synced_at": _synced_at(storage)}
+        ordered = sorted(domain_list, key=lambda d: d.name)
+        if mx_only:
+            data["mx"] = [
+                {"domain": d.name, "provider": d.email_mx.provider,
+                 "mx_records": d.email_mx.mx_records}
+                for d in ordered if d.email_mx
+            ]
+        if smtp_only:
+            data["smtp"] = [
+                {"domain": d.name, "provider": x.provider, "spf": x.has_spf,
+                 "dkim": x.has_dkim, "dkim_record": x.dkim_record}
+                for d in ordered for x in d.email_smtp
+            ]
+        emit(data)
 
     finally:
         storage.close()
@@ -580,10 +727,12 @@ def records(domain_name: str):
     try:
         dom = storage.get_domain(domain_name)
         if not dom:
-            console.print(f"[red]Domain '{domain_name}' not found.[/red]")
-            raise typer.Exit(1)
+            fail(f"Domain '{domain_name}' not found. Run 'dnsimple sync' if it is new.")
+            return
 
+        synced = _synced_at(storage)
         table = Table(title=f"Records for {domain_name}")
+        table.add_column("ID", justify="right", style="dim")
         table.add_column("Name", style="cyan")
         table.add_column("Type")
         table.add_column("Content")
@@ -596,13 +745,24 @@ def records(domain_name: str):
             if len(content) > 60:
                 content = content[:57] + "..."
             table.add_row(
+                str(record.id),
                 name,
                 record.type,
                 content,
                 str(record.ttl),
             )
 
-        console.print(table)
+        show(table)
+        console.print(f"[dim]Synced at: {synced}. Use the ID with record-update / record-delete.[/dim]")
+        emit({
+            "domain": domain_name,
+            "synced_at": synced,
+            "records": [
+                {"id": r.id, "name": r.name, "type": r.type, "content": r.content,
+                 "ttl": r.ttl, "priority": r.priority}
+                for r in sorted(dom.records, key=lambda r: (r.type, r.name, r.id))
+            ],
+        })
 
     finally:
         storage.close()
@@ -624,6 +784,7 @@ def report():
     try:
         output_path = generate_report()
         console.print(f"\n[green]Report generated:[/green] {output_path}")
+        emit({"path": str(output_path)})
     except ReportError as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
@@ -663,10 +824,17 @@ def contacts():
                     c.get("country", ""),
                 )
 
-            console.print(table)
+            show(table)
             console.print(
                 "\n[dim]Use the contact ID as --registrant-id when transferring domains.[/dim]"
             )
+            emit({"contacts": [
+                {"id": c["id"], "first_name": c.get("first_name"),
+                 "last_name": c.get("last_name"),
+                 "organization_name": c.get("organization_name"), "email": c.get("email"),
+                 "country": c.get("country")}
+                for c in contact_list
+            ]})
 
     except DNSimpleAPIError as e:
         console.print(f"[red]API Error:[/red] {e.message}")
@@ -684,6 +852,29 @@ def transfer_check(
         with get_client() as client:
             tld = domain_name.split(".")[-1]
 
+            # Already registered here? Then there is nothing to transfer.
+            owned = next(
+                (d for d in client.list_domains()
+                 if d.get("name", "").lower() == domain_name.lower()),
+                None,
+            )
+            if owned and owned.get("state") == "registered":
+                expires = owned.get("expires_at") or owned.get("expires_on")
+                console.print(
+                    f"\n[green]{domain_name} is already registered at DNSimple[/green]"
+                    + (f" (expires {expires})" if expires else "")
+                    + ". Nothing to transfer."
+                )
+                emit({"domain": domain_name, "already_at_dnsimple": True,
+                      "state": owned.get("state"), "expires": expires,
+                      "auto_renew": owned.get("auto_renew")})
+                return
+
+            check: dict[str, Any] = {
+                "domain": domain_name,
+                "already_at_dnsimple": False,
+                "state": owned.get("state") if owned else None,
+            }
             console.print(
                 f"\n[bold]Transfer pre-flight check for {domain_name}[/bold]\n"
             )
@@ -691,13 +882,12 @@ def transfer_check(
             # Check TLD supports transfer
             console.print(f"Checking .{tld} TLD support...", end=" ")
             tld_info = client.get_tld(tld)
+            check["tld_transfer_enabled"] = bool(tld_info.get("transfer_enabled"))
             if tld_info.get("transfer_enabled"):
                 console.print(f"[green]OK[/green] - .{tld} supports transfers")
             else:
-                console.print(
-                    f"[red]FAILED[/red] - .{tld} does not support transfers"
-                )
-                raise typer.Exit(1)
+                console.print(f"FAILED - .{tld} does not support transfers")
+                fail(f".{tld} does not support transfers to DNSimple")
 
             # Get transfer pricing
             console.print("Checking transfer price...", end=" ")
@@ -705,6 +895,8 @@ def transfer_check(
                 prices = client.get_domain_prices(domain_name, action="transfer")
                 price = prices.get("transfer_price", prices.get("price", "unknown"))
                 premium = prices.get("premium", False)
+                check["price"] = price
+                check["premium"] = bool(premium)
                 price_display = f"[green]${price}/year[/green]"
                 if premium:
                     price_display += " [yellow](PREMIUM)[/yellow]"
@@ -720,9 +912,11 @@ def transfer_check(
             # WHOIS transfer lock check
             console.print("Checking WHOIS transfer lock...", end=" ")
             is_locked, statuses = check_whois_transfer_lock(domain_name)
+            check["whois_locked"] = is_locked if statuses else None
+            check["whois_statuses"] = statuses
             if is_locked:
                 console.print(
-                    "[red]LOCKED[/red] - domain has clientTransferProhibited status"
+                    "[yellow]LOCKED[/yellow] - domain has clientTransferProhibited status"
                 )
                 console.print(
                     "[yellow]You must unlock this domain at your current registrar before transferring.[/yellow]"
@@ -743,6 +937,7 @@ def transfer_check(
             console.print(
                 f'\n[dim]When ready: dnsimple transfer {domain_name} --auth-code "YOUR_CODE"[/dim]'
             )
+            emit(check)
 
     except DNSimpleAPIError as e:
         console.print(f"\n[red]API Error:[/red] {e.message}")
@@ -831,7 +1026,7 @@ def transfer(
                 console.print(f"  WHOIS privacy: {'Yes' if whois_privacy else 'No'}")
                 console.print(f"  Cost:          ${price}")
                 console.print()
-                confirmed = typer.confirm("Proceed with transfer?")
+                confirmed = ask("Proceed with transfer?")
                 if not confirmed:
                     console.print("[yellow]Transfer cancelled.[/yellow]")
                     storage.close()
@@ -870,12 +1065,15 @@ def transfer(
 
             # Save to local tracking
             transfer_obj = DomainTransfer.from_api(result, domain_name)
-            transfer_obj.initiated_at = datetime.now()
-            transfer_obj.last_checked_at = datetime.now()
+            transfer_obj.initiated_at = utcnow()
+            transfer_obj.last_checked_at = utcnow()
 
             storage.save_transfer(transfer_obj)
             storage.close()
 
+            emit({"transfer": {"id": result["id"], "domain": domain_name,
+                               "state": result["state"],
+                               "status_description": result.get("status_description")}})
             console.print(f"\n[green]Transfer initiated![/green]")
             console.print(f"  Transfer ID: {result['id']}")
             console.print(f"  State:       {result['state']}")
@@ -926,6 +1124,7 @@ def transfer_status(
                 console.print(
                     "[yellow]No transfers tracked. Use 'dnsimple transfer' to start one.[/yellow]"
                 )
+                emit({"transfers": []})
                 raise typer.Exit(0)
 
         # Optionally refresh from API
@@ -948,7 +1147,7 @@ def transfer_status(
                                 t.updated_at = datetime.fromisoformat(
                                     raw_updated.replace("Z", "+00:00")
                                 )
-                            t.last_checked_at = datetime.now()
+                            t.last_checked_at = utcnow()
                             storage.save_transfer(t)
                             console.print(f"[green]{t.state}[/green]")
                         except DNSimpleAPIError as e:
@@ -972,16 +1171,8 @@ def transfer_status(
 
         for t in sorted(transfers, key=lambda x: x.domain_name):
             state_display = state_styles.get(t.state, t.state)
-            initiated = (
-                t.initiated_at.strftime("%Y-%m-%d %H:%M")
-                if t.initiated_at
-                else "-"
-            )
-            checked = (
-                t.last_checked_at.strftime("%Y-%m-%d %H:%M")
-                if t.last_checked_at
-                else "-"
-            )
+            initiated = utc_iso(t.initiated_at) or "-"
+            checked = utc_iso(t.last_checked_at) or "-"
 
             table.add_row(
                 t.domain_name,
@@ -992,7 +1183,15 @@ def transfer_status(
                 checked,
             )
 
-        console.print(table)
+        show(table)
+
+        emit({"transfers": [
+            {"domain": t.domain_name, "id": t.id, "state": t.state,
+             "status_description": t.status_description or None,
+             "initiated_at": utc_iso(t.initiated_at),
+             "last_checked_at": utc_iso(t.last_checked_at)}
+            for t in sorted(transfers, key=lambda x: x.domain_name)
+        ]})
 
         # Hint for active transfers
         active = [
@@ -1032,7 +1231,7 @@ def transfer_cancel(
             raise typer.Exit(0)
 
         if not yes:
-            confirmed = typer.confirm(f"Cancel transfer for {domain_name}?")
+            confirmed = ask(f"Cancel transfer for {domain_name}?")
             if not confirmed:
                 raise typer.Exit(0)
 
@@ -1042,7 +1241,7 @@ def transfer_cancel(
             transfer_obj.status_description = result.get(
                 "status_description", ""
             )
-            transfer_obj.last_checked_at = datetime.now()
+            transfer_obj.last_checked_at = utcnow()
             storage.save_transfer(transfer_obj)
 
             console.print(
@@ -1161,7 +1360,7 @@ def email_setup(
                     pri_display,
                 )
 
-            console.print(table)
+            show(table)
 
             if spf_action == "merge":
                 console.print(
@@ -1173,7 +1372,7 @@ def email_setup(
             # Confirmation
             if not yes:
                 console.print()
-                confirmed = typer.confirm("Proceed with email setup?")
+                confirmed = ask("Proceed with email setup?")
                 if not confirmed:
                     console.print("[yellow]Setup cancelled.[/yellow]")
                     raise typer.Exit(0)
@@ -1326,7 +1525,7 @@ def redirect_setup(
                 for skip_msg in plan["skipped"]:
                     table.add_row(plan["domain"], "[dim]skip[/dim]", f"[dim]{skip_msg}[/dim]", "")
 
-            console.print(table)
+            show(table)
 
             if total_count == 0:
                 console.print("\n[yellow]Nothing to create — all records already exist.[/yellow]")
@@ -1334,7 +1533,7 @@ def redirect_setup(
 
             if not yes:
                 console.print()
-                confirmed = typer.confirm(f"Create {total_count} redirect record(s)?")
+                confirmed = ask(f"Create {total_count} redirect record(s)?")
                 if not confirmed:
                     console.print("[yellow]Setup cancelled.[/yellow]")
                     raise typer.Exit(0)
@@ -1486,7 +1685,7 @@ def app_setup(
                     name_display = "@" if rec["name"] == "" else rec["name"]
                     table.add_row(rec["type"], name_display, rec["content"])
 
-                console.print(table)
+                show(table)
 
                 if skip_acme:
                     console.print(
@@ -1499,7 +1698,7 @@ def app_setup(
 
                 if not yes:
                     console.print()
-                    confirmed = typer.confirm("Proceed with Deno Deploy apex setup?")
+                    confirmed = ask("Proceed with Deno Deploy apex setup?")
                     if not confirmed:
                         console.print("[yellow]Setup cancelled.[/yellow]")
                         raise typer.Exit(0)
@@ -1586,7 +1785,7 @@ def app_setup(
                 name_display = "@" if rec["name"] == "" else rec["name"]
                 table.add_row(rec["type"], name_display, rec["content"])
 
-            console.print(table)
+            show(table)
 
             if skip_naked:
                 console.print(
@@ -1599,7 +1798,7 @@ def app_setup(
 
             if not yes:
                 console.print()
-                confirmed = typer.confirm("Proceed with Deno Deploy setup?")
+                confirmed = ask("Proceed with Deno Deploy setup?")
                 if not confirmed:
                     console.print("[yellow]Setup cancelled.[/yellow]")
                     raise typer.Exit(0)
@@ -1738,11 +1937,11 @@ def clerk_setup(
             for rec in to_create:
                 table.add_row(rec["name"], rec["label"], rec["content"])
 
-            console.print(table)
+            show(table)
 
             if not yes:
                 console.print()
-                confirmed = typer.confirm(
+                confirmed = ask(
                     f"Create {len(to_create)} Clerk CNAME record(s)?"
                 )
                 if not confirmed:
@@ -1878,7 +2077,7 @@ def record_delete(
 
             if not yes:
                 console.print()
-                confirmed = typer.confirm("Delete this record?")
+                confirmed = ask("Delete this record?")
                 if not confirmed:
                     console.print("[yellow]Deletion cancelled.[/yellow]")
                     raise typer.Exit(0)
@@ -1963,7 +2162,7 @@ def record_update(
 
             if not yes:
                 console.print()
-                if not typer.confirm("Apply this update?"):
+                if not ask("Apply this update?"):
                     console.print("[yellow]Update cancelled.[/yellow]")
                     raise typer.Exit(0)
 
@@ -2010,35 +2209,51 @@ DNSIMPLE_NS_HOSTS = {
 def nameservers(
     domain: Annotated[str, typer.Argument(help="Domain name")],
     set_dnsimple: Annotated[
+        bool, typer.Option("--set-dnsimple", hidden=True)
+    ] = False,
+    ns: Annotated[list[str] | None, typer.Option("--ns", hidden=True)] = None,
+):
+    """Show the registry nameserver delegation for a domain. Read-only.
+
+    To change it, use `nameservers-set`.
+    """
+    if set_dnsimple or ns:
+        fail(
+            "nameservers is read-only since 0.2.0; use "
+            f"'dnsimple nameservers-set {domain} --dnsimple' or '--ns <host> …'"
+        )
+    try:
+        with get_client() as client:
+            current = client.get_delegation(domain)
+    except DNSimpleAPIError as e:
+        fail(f"API Error: {e.message}")
+        return
+    on_dnsimple = bool(current) and set(current).issubset(DNSIMPLE_NS_HOSTS)
+    console.print(f"\n[bold]{domain}[/bold] current delegation:")
+    for n in current:
+        console.print(f"  {n}")
+    emit({"domain": domain, "nameservers": current, "on_dnsimple": on_dnsimple})
+
+
+@app.command("nameservers-set")
+def nameservers_set(
+    domain: Annotated[str, typer.Argument(help="Domain name (registered at DNSimple)")],
+    dnsimple_ns: Annotated[
         bool,
-        typer.Option(
-            "--set-dnsimple",
-            help="Set delegation to DNSimple's default 4 edge nameservers",
-        ),
+        typer.Option("--dnsimple", help="Delegate to DNSimple's four edge nameservers"),
     ] = False,
     ns: Annotated[
         list[str] | None,
-        typer.Option(
-            "--ns",
-            help="Custom nameserver (repeat for multiple). Mutually exclusive with --set-dnsimple",
-        ),
+        typer.Option("--ns", help="Custom nameserver (repeat). Exclusive with --dnsimple"),
     ] = None,
     yes: Annotated[
         bool, typer.Option("--yes", "-y", help="Skip confirmation")
     ] = False,
 ):
-    """Show or change the registry nameserver delegation for a domain.
-
-    With no flags, prints the current delegation. With --set-dnsimple, flips
-    to the standard DNSimple edge nameservers. With --ns repeated, sets a
-    custom list. Domain must be registered at DNSimple.
-    """
-    if set_dnsimple and ns:
-        console.print(
-            "[red]Error:[/red] --set-dnsimple and --ns are mutually exclusive"
-        )
-        raise typer.Exit(1)
-
+    """Change the registry nameserver delegation for a domain. Confirms unless --yes."""
+    if dnsimple_ns == bool(ns):
+        fail("pass exactly one of --dnsimple or --ns <host> (repeatable)")
+    target_ns = DNSIMPLE_DEFAULT_NS if dnsimple_ns else list(ns or [])
     try:
         with get_client() as client:
             current = client.get_delegation(domain)
@@ -2046,13 +2261,9 @@ def nameservers(
             for n in current:
                 console.print(f"  {n}")
 
-            if not set_dnsimple and not ns:
-                return  # show-only mode
-
-            target_ns = DNSIMPLE_DEFAULT_NS if set_dnsimple else list(ns or [])
-
             if sorted(target_ns) == sorted(current):
                 console.print("\n[green]Already set to the requested NS.[/green]")
+                emit({"domain": domain, "nameservers": current, "changed": False})
                 return
 
             console.print("\n[bold]New delegation:[/bold]")
@@ -2061,7 +2272,7 @@ def nameservers(
 
             if not yes:
                 console.print()
-                if not typer.confirm("Apply this delegation change?"):
+                if not ask("Apply this delegation change?"):
                     console.print("[yellow]Cancelled.[/yellow]")
                     raise typer.Exit(0)
 
@@ -2069,10 +2280,11 @@ def nameservers(
             console.print("\n[green]Delegation updated.[/green] New NS:")
             for n in updated:
                 console.print(f"  {n}")
+            emit({"domain": domain, "previous": current, "nameservers": updated,
+                  "changed": True})
 
     except DNSimpleAPIError as e:
-        console.print(f"[red]API Error:[/red] {e.message}")
-        raise typer.Exit(1)
+        fail(f"API Error: {e.message}")
 
 
 @app.command("delegation-audit")
@@ -2129,15 +2341,20 @@ def delegation_audit():
     for d, reason in not_registered:
         table.add_row(d, f"[dim]Skipped ({reason})[/dim]", "—")
 
-    console.print(table)
+    show(table)
     console.print(
         f"\n{len(on_dnsimple)} on DNSimple, {len(elsewhere)} elsewhere, "
         f"{len(not_registered)} skipped."
     )
     if elsewhere:
         console.print(
-            "\n[dim]To flip:[/dim] dnsimple nameservers <domain> --set-dnsimple"
+            "\n[dim]To flip:[/dim] dnsimple nameservers-set <domain> --dnsimple"
         )
+    emit({
+        "on_dnsimple": on_dnsimple,
+        "elsewhere": [{"domain": d, "nameservers": n} for d, n in elsewhere],
+        "skipped": [{"domain": d, "reason": r} for d, r in not_registered],
+    })
 
 
 @app.command()
@@ -2150,12 +2367,11 @@ def health(
     with Storage() as storage:
         dom = storage.get_domain(domain)
         if not dom:
-            console.print(
-                f"[red]Domain '{domain}' not found.[/red] Run [bold]dnsimple sync[/bold] first."
-            )
-            raise typer.Exit(1)
+            fail(f"Domain '{domain}' not found. Run 'dnsimple sync' first.")
+            return
 
         report = run_health_check(dom.name, dom.records)
+        synced = _synced_at(storage)
 
     # Status styling
     status_style = {
@@ -2164,7 +2380,7 @@ def health(
         "fail": "[red]FAIL[/red]",
     }
 
-    console.print(f"\n[bold]Health Check: {report.domain}[/bold]\n")
+    console.print(f"\n[bold]Health Check: {report.domain}[/bold] ({report.mail_mode})\n")
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("Status", width=6, justify="center")
@@ -2172,13 +2388,16 @@ def health(
     table.add_column("Details")
 
     for result in report.results:
+        details = result.message
+        if result.recommendation:
+            details += f"\n→ {result.recommendation}"
         table.add_row(
             status_style[result.status],
             result.check,
-            result.message,
+            details,
         )
 
-    console.print(table)
+    show(table)
 
     # Summary
     console.print(
@@ -2191,6 +2410,19 @@ def health(
         console.print(
             f"\n  [dim]Full check: https://mxtoolbox.com/emailhealth/{domain}/[/dim]"
         )
+    console.print(f"  [dim]From synced data, synced at {synced}[/dim]")
+    emit({
+        "domain": report.domain,
+        "synced_at": synced,
+        "mail_mode": report.mail_mode,
+        "summary": {"pass": report.pass_count, "warn": report.warn_count,
+                    "fail": report.fail_count},
+        "results": [
+            {"check": r.check, "status": r.status, "message": r.message,
+             "recommendation": r.recommendation}
+            for r in report.results
+        ],
+    })
 
 
 if __name__ == "__main__":
